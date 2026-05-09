@@ -34,6 +34,11 @@ FORCE_MIN_DELAY = 0.3  # HARD BRAKE: Minimum seconds between requests. Prevents 
 MAX_IDLE_DELAY  = 4.5  # Backoff time when completely idle
 # ------------------------------------
 
+# --- BYPASS CONFIGURATION ---
+BYPASS_EXACT_DOMAINS = {"mail.google.com", "www.google.com", "ssl.gstatic.com", "google.com"}
+BYPASS_SUFFIXES = (".ir",)
+# ----------------------------
+
 POST_TIMEOUT  = 35
 CHUNK_SIZE    = 65536
 SESSION_ID    = str(uuid.uuid4())
@@ -267,6 +272,14 @@ class TunnelClient:
         self._nid += 1
         return self._nid
 
+    def _should_bypass(self, host: str) -> bool:
+        """Check if the given host should bypass the tunnel and connect directly."""
+        if host in BYPASS_EXACT_DOMAINS:
+            return True
+        if host.endswith(BYPASS_SUFFIXES):
+            return True
+        return False
+
     async def _socks5(self, reader, writer) -> Optional[tuple]:
         try:
             hdr = await asyncio.wait_for(reader.readexactly(2), 15)
@@ -297,10 +310,49 @@ class TunnelClient:
             return None
 
     async def _handle_local(self, reader, writer):
+        should_close = True
         try:
             result = await self._socks5(reader, writer)
-            if not result: return writer.close()
+            if not result: return
             host, port = result
+
+            # -----------------------------------------------------------------
+            # BYPASS LOGIC: Route specific traffic directly instead of proxying
+            # -----------------------------------------------------------------
+            if self._should_bypass(host):
+                log.info(f"DIRECT ROUTE (Bypassing proxy) -> {host}:{port}")
+                try:
+                    remote_reader, remote_writer = await asyncio.open_connection(host, port)
+                except Exception as e:
+                    log.error(f"Direct connection failed to {host}:{port}: {e}")
+                    return
+
+                # Send SOCKS5 Success to local client
+                writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+                await writer.drain()
+                
+                # Signal not to close writer in 'finally', the relays will handle it
+                should_close = False 
+
+                async def relay(src, dst):
+                    try:
+                        while True:
+                            data = await src.read(CHUNK_SIZE)
+                            if not data: break
+                            dst.write(data)
+                            await dst.drain()
+                    except Exception: pass
+                    finally:
+                        try: dst.close()
+                        except Exception: pass
+
+                # Start bi-directional forwarding
+                asyncio.create_task(relay(reader, remote_writer))
+                asyncio.create_task(relay(remote_reader, writer))
+                return
+            # -----------------------------------------------------------------
+
+            # Continue with normal proxying for non-bypassed domains
             cid = self._next_id()
             conn = Conn(cid, reader, writer, host, port)
 
@@ -312,10 +364,12 @@ class TunnelClient:
             
             self.wakeup_event.set()
             await self._drain_local(conn)
+            
         except Exception: pass
         finally:
-            try: writer.close()
-            except Exception: pass
+            if should_close:
+                try: writer.close()
+                except Exception: pass
 
     async def _drain_local(self, conn: Conn):
         try:
@@ -449,6 +503,8 @@ class TunnelClient:
         server = await asyncio.start_server(self._handle_local, self.socks_host, self.socks_port)
         log.info(f"SOCKS5     → {self.socks_host}:{self.socks_port}")
         log.info(f"Speed Limit Check: FORCE_MIN_DELAY is set to {FORCE_MIN_DELAY}s")
+        log.info(f"Bypassing domains ending in: {BYPASS_SUFFIXES}")
+        log.info(f"Bypassing specific domains: {BYPASS_EXACT_DOMAINS}")
         log.info(f"Starting Session... Today's Request Count: {self.requests_today}")
         
         asyncio.create_task(self._poll_loop())

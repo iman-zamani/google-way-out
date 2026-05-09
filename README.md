@@ -101,9 +101,9 @@ Point your browser or application to use a SOCKS5 proxy at `127.0.0.1:1080`. In 
 
 ---
 
-## Limitations
+## Performance
 
-This setup will not give you fast or consistent performance. Latency is inherently high because every request must round-trip through Google's script infrastructure. It is suitable for browsing and light API usage, not for high-throughput or latency-sensitive applications.
+Latency is inherently higher than a direct connection because every request routes through Google's script infrastructure. That said, this implementation is meaningfully faster than older approaches using the same technique — the adaptive polling algorithm, keep-alive HTTP connections, and stream support all reduce overhead compared to naive relay implementations. It is well-suited for everyday browsing and API usage.
 
 ---
 

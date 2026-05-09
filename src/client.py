@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-POST Tunnel Client - Smart Polling, Keep-Alive & Quota Tracking Edition
-=======================================================================
+POST Tunnel Client - Speed Limited & Quota Tracking Edition, optimized for longer usage 
+===========================================================
 """
 
 import asyncio
@@ -20,7 +20,6 @@ from typing import Dict, Optional, Tuple
 
 # ── configuration ──────────────────────────────────────────────────────────────
 
-
 SERVER_URL    = "https://script.google.com/macros/s/your-GAS-path/exec" # <--- change this 
 VPS_URL       = "http://VPS_IP/tunnel"                                  # <--- change this 
 
@@ -30,9 +29,11 @@ SNI_HOST      = "www.google.com"
 SOCKS5_HOST   = "127.0.0.1"
 SOCKS5_PORT   = 1080
 
-# Smart Polling config
-MIN_INTERVAL  = 0.05  # How fast to poll when actively browsing
-MAX_INTERVAL  = 4.5   # Backoff time when completely idle (saves GAS quota)
+# --- SMART POLLING & SPEED LIMITS ---
+FORCE_MIN_DELAY = 0.3  # HARD BRAKE: Minimum seconds between requests. Prevents quota burn.
+MAX_IDLE_DELAY  = 4.5  # Backoff time when completely idle
+# ------------------------------------
+
 POST_TIMEOUT  = 35
 CHUNK_SIZE    = 65536
 SESSION_ID    = str(uuid.uuid4())
@@ -141,7 +142,6 @@ async def _read_response(reader: asyncio.StreamReader, read_timeout: float = 20.
 
 
 class KeepAliveClient:
-    """Maintains a persistent TLS connection to Google to eliminate handshake overhead."""
     def __init__(self):
         self.reader = None
         self.writer = None
@@ -240,14 +240,13 @@ class TunnelClient:
         # Quota Tracking Setup
         self.quota_file = "gas_quota.json"
         self.requests_today = self._load_quota()
+        self.last_100_time = time.monotonic()  # Start timer for average calculation
 
     def _load_quota(self) -> int:
-        """Loads today's request count from disk."""
         try:
             if os.path.exists(self.quota_file):
                 with open(self.quota_file, "r") as f:
                     data = json.load(f)
-                    # If it's a new day, reset to 0. Otherwise, load the count.
                     if data.get("date") == datetime.date.today().isoformat():
                         return data.get("count", 0)
         except Exception:
@@ -255,7 +254,6 @@ class TunnelClient:
         return 0
 
     def _save_quota(self):
-        """Saves current count to disk so it survives restarts."""
         try:
             with open(self.quota_file, "w") as f:
                 json.dump({
@@ -334,14 +332,23 @@ class TunnelClient:
             conn.local_eof = True
             self.wakeup_event.set()
 
-    # ── Smart Adaptive poll loop ───────────────────────────────────────────────
+    # ── Smart Speed-Limited poll loop ──────────────────────────────────────────
 
     async def _poll_loop(self):
-        current_interval = MIN_INTERVAL
+        current_delay = FORCE_MIN_DELAY
+        last_poll_end = 0.0
+
         while True:
             self.wakeup_event.clear()
             
-            t0 = time.monotonic()
+            # --- THE HARD BRAKE ---
+            # Guarantee that we NEVER fire faster than FORCE_MIN_DELAY
+            now = time.monotonic()
+            time_since_last = now - last_poll_end
+            if time_since_last < FORCE_MIN_DELAY:
+                await asyncio.sleep(FORCE_MIN_DELAY - time_since_last)
+            # ----------------------
+
             sent_something, rcvd_something = False, False
             try:
                 sent_something, rcvd_something = await self._poll()
@@ -349,17 +356,21 @@ class TunnelClient:
                 log.error(f"poll exception: {e}")
                 await asyncio.sleep(1.0) 
 
-            if sent_something or rcvd_something:
-                current_interval = MIN_INTERVAL
-            else:
-                current_interval = min(MAX_INTERVAL, current_interval + 0.2)
+            # Update the end timer
+            last_poll_end = time.monotonic()
 
-            elapsed = time.monotonic() - t0
-            sleep_time = max(0.0, current_interval - elapsed)
+            if sent_something or rcvd_something:
+                current_delay = FORCE_MIN_DELAY
+            else:
+                current_delay = min(MAX_IDLE_DELAY, current_delay + 0.2)
+
+            now = time.monotonic()
+            time_to_sleep = current_delay - (now - last_poll_end)
             
-            if sleep_time > 0:
+            if time_to_sleep > 0:
                 try:
-                    await asyncio.wait_for(self.wakeup_event.wait(), timeout=sleep_time)
+                    # Sleep until time is up, OR the browser wakes us up
+                    await asyncio.wait_for(self.wakeup_event.wait(), timeout=time_to_sleep)
                 except asyncio.TimeoutError:
                     pass
 
@@ -393,13 +404,18 @@ class TunnelClient:
         try:
             reply = await self.http.post(self.url, proxy_payload, POST_TIMEOUT)
             
-            # --- QUOTA TRACKING LOGIC ---
+            # --- QUOTA & SPEED TRACKING LOGIC ---
             self.requests_today += 1
             if self.requests_today % 100 == 0:
-                self._save_quota() # Save to disk every 100 requests
+                self._save_quota() 
                 remaining = max(0, 20000 - self.requests_today)
-                log.info(f"📊 QUOTA UPDATE: {self.requests_today}/20000 requests used today (~{remaining} left).")
-            # ----------------------------
+                
+                now = time.monotonic()
+                avg_time = (now - self.last_100_time) / 100.0
+                self.last_100_time = now
+                
+                log.info(f"📊 QUOTA: {self.requests_today}/20000 (~{remaining} left). Avg gap: {avg_time:.2f}s/req")
+            # ------------------------------------
 
         except Exception as e:
             async with self._lock:
@@ -432,7 +448,7 @@ class TunnelClient:
     async def run(self):
         server = await asyncio.start_server(self._handle_local, self.socks_host, self.socks_port)
         log.info(f"SOCKS5     → {self.socks_host}:{self.socks_port}")
-        log.info("Smart Adaptive Polling & Keep-Alive Enabled")
+        log.info(f"Speed Limit Check: FORCE_MIN_DELAY is set to {FORCE_MIN_DELAY}s")
         log.info(f"Starting Session... Today's Request Count: {self.requests_today}")
         
         asyncio.create_task(self._poll_loop())

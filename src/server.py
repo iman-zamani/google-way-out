@@ -28,7 +28,7 @@ class ConnState:
         self.failed = False
         # Remote-to-Client background buffer (The "Sponge")
         self.pending_data = bytearray()
-        # Client-to-Remote buffer (used only while TCP handshake is pending)
+        # Client-to-Remote buffer (used for 0-RTT payload buffering)
         self.outbound_buf = bytearray()
         self.remote_eof = False
         self.read_task = None
@@ -54,7 +54,7 @@ async def _background_reader(sess: SessionState, cid: int, cs: ConnState):
     """Continuously reads from the remote socket and buffers it in user-space."""
     try:
         while True:
-            # Hard Cap: Pause reading if buffer exceeds 5MB to prevent memory exhaustion
+            # Hard Cap: Pause reading if buffer exceeds 5MB
             if len(cs.pending_data) > 5242880:
                 await asyncio.sleep(0.1)
                 continue
@@ -88,7 +88,7 @@ async def _connect_task(sess: SessionState, cid: int, host: str, port: int):
             
         cs.reader, cs.writer, cs.ready = r, w, True
         
-        # Grab any data the client sent while we were connecting
+        # 0-RTT Execution: Grab data the client sent in the 'open' frame
         if cs.outbound_buf:
             pending = bytes(cs.outbound_buf)
             cs.outbound_buf.clear()
@@ -96,7 +96,7 @@ async def _connect_task(sess: SessionState, cid: int, host: str, port: int):
         # Spawn the continuous background reader
         cs.read_task = asyncio.create_task(_background_reader(sess, cid, cs))
 
-    # Flush pending client outbound data
+    # Flush 0-RTT outbound data immediately upon connection
     if pending:
         try:
             w.write(pending)
@@ -108,13 +108,13 @@ async def handle_tunnel(req: web.Request) -> web.Response:
     except: return web.Response(status=400)
 
     sid, frames = body.get("sid", "__anon__"), body.get("frames", [])
-    
     if frames:
         log.info(f"Received request with {len(frames)} frames for session [{sid[:8]}]")
 
     sess = await _get_session(sid)
     new_connects, writes_todo = [], []
 
+    # RESTORED: JSONL Stream Response
     response = web.StreamResponse()
     response.content_type = 'application/jsonl'
     await response.prepare(req)
@@ -129,13 +129,19 @@ async def handle_tunnel(req: web.Request) -> web.Response:
             ft, cid = f.get("t"), f.get("id")
             if ft == "open":
                 sess.conns[cid] = ConnState()
+                cs = sess.conns[cid]
+                # 0-RTT Reception: Buffer early data payload if it exists
+                if "d" in f:
+                    cs.outbound_buf.extend(base64.b64decode(f["d"]))
                 new_connects.append((cid, f.get("h", ""), int(f.get("p", 0))))
+                
             elif ft == "data":
                 cs = sess.conns.get(cid)
                 if cs:
                     raw = base64.b64decode(f["d"])
                     if cs.ready: writes_todo.append((cs.writer, raw))
                     elif not cs.failed: cs.outbound_buf.extend(raw)
+                    
             elif ft == "close":
                 cs = sess.conns.pop(cid, None)
                 if cs:
@@ -160,14 +166,13 @@ async def handle_tunnel(req: web.Request) -> web.Response:
         for cid, cs in list(sess.conns.items()):
             if not cs.ready: continue
             
-            # Slice up to 3145728 bytes (3MB) instantly
+            # Slice up to 3145728 bytes (3MB) instantly from User-Space Memory
             extract_len = min(len(cs.pending_data), 3145728)
             data = None
             if extract_len > 0:
                 data = bytes(cs.pending_data[:extract_len])
                 del cs.pending_data[:extract_len]
             
-            # If the remote closed the connection AND our sponge is fully drained
             eof_close = (cs.remote_eof and len(cs.pending_data) == 0)
             if eof_close:
                 if cs.writer:

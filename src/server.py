@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import asyncio
 import base64
+import json
 import logging
 import sys
 import time
+import zlib
 from typing import Dict, List, Optional
 from aiohttp import web
 
@@ -12,9 +14,10 @@ BIND_PORT       = 8080
 AUTH_TOKEN      = "" 
 
 CONNECT_TIMEOUT = 8.0
-# Drastically reduced wait times to prevent lag buildup
-COLLECT_WAIT    = 0.02
-READ_CHUNK      = 65536
+# OPTIMIZATION 1: Zero-Penalty Buffering variables
+COLLECT_WAIT    = 0.05
+READ_CHUNK      = 1048576 # 1MB chunks
+MAX_READ_CAP    = 3145728 # 3MB hard cap
 READ_TIMEOUT    = 0.02
 SESSION_TTL     = 120
 GC_INTERVAL     = 30
@@ -81,7 +84,10 @@ async def _drain_remote(reader: asyncio.StreamReader, budget: float = COLLECT_WA
             chunk = await asyncio.wait_for(reader.read(READ_CHUNK), timeout=min(rem, READ_TIMEOUT))
             if not chunk: break
             buf.extend(chunk)
-            if len(chunk) < READ_CHUNK: break # Break instantly if we read partial chunk
+            # OPTIMIZATION 1: OS buffer is empty, break instantly without waiting for timeout
+            if len(chunk) < READ_CHUNK: break
+            # OPTIMIZATION 1: Hard cap to prevent GAS memory crashes
+            if len(buf) >= MAX_READ_CAP: break
         except: break
     return bytes(buf)
 
@@ -91,11 +97,18 @@ async def handle_tunnel(req: web.Request) -> web.Response:
 
     sid, frames = body.get("sid", "__anon__"), body.get("frames", [])
     sess = await _get_session(sid)
-    out_frames, new_connects, writes_todo = [], [], []
+    new_connects, writes_todo = [], []
+
+    # OPTIMIZATION 3: JSON-Lines Streaming Response setup
+    response = web.StreamResponse()
+    response.content_type = 'application/jsonl'
+    await response.prepare(req)
 
     async with sess.lock:
-        out_frames.extend(sess.error_queue)
+        for f in sess.error_queue:
+            await response.write((json.dumps(f) + "\n").encode())
         sess.error_queue.clear()
+        
         for f in frames:
             ft, cid = f.get("t"), f.get("id")
             if ft == "open":
@@ -105,6 +118,10 @@ async def handle_tunnel(req: web.Request) -> web.Response:
                 cs = sess.conns.get(cid)
                 if cs:
                     raw = base64.b64decode(f["d"])
+                    # OPTIMIZATION 2: Decompress incoming payload
+                    try: raw = zlib.decompress(raw)
+                    except Exception: pass
+
                     if cs.ready: writes_todo.append((cs.writer, raw))
                     elif not cs.failed: cs.pending_data.extend(raw)
             elif ft == "close":
@@ -113,7 +130,8 @@ async def handle_tunnel(req: web.Request) -> web.Response:
                     try: cs.writer.close()
                     except: pass
 
-    for cid, host, port in new_connects: asyncio.create_task(_connect_task(sess, cid, host, port))
+    for cid, host, port in new_connects: 
+        asyncio.create_task(_connect_task(sess, cid, host, port))
     
     for writer, raw in writes_todo:
         try:
@@ -125,22 +143,29 @@ async def handle_tunnel(req: web.Request) -> web.Response:
         ready = [(cid, cs.reader) for cid, cs in sess.conns.items() if cs.ready and cs.reader]
 
     if ready:
-        async def read_one(cid, reader): return cid, await _drain_remote(reader), reader.at_eof()
-        results = await asyncio.gather(*[read_one(cid, r) for cid, r in ready], return_exceptions=True)
-
-        async with sess.lock:
-            for item in results:
-                if isinstance(item, Exception): continue
-                cid, data, eof = item
-                if data: out_frames.append({"t": "data", "id": cid, "d": base64.b64encode(data).decode()})
+        async def read_one(c_id, r): return c_id, await _drain_remote(r), r.at_eof()
+        tasks = [asyncio.create_task(read_one(cid, r)) for cid, r in ready]
+        
+        # Write frames to stream immediately as they complete
+        for task in asyncio.as_completed(tasks):
+            try:
+                cid, data, eof = await task
+                if data:
+                    # OPTIMIZATION 2: Zlib Compression
+                    comp = zlib.compress(data, level=6)
+                    out_f = {"t": "data", "id": cid, "d": base64.b64encode(comp).decode()}
+                    await response.write((json.dumps(out_f) + "\n").encode())
                 if eof:
-                    cs = sess.conns.pop(cid, None)
-                    if cs and cs.writer:
-                        try: cs.writer.close()
-                        except: pass
-                    out_frames.append({"t": "close", "id": cid})
+                    async with sess.lock:
+                        cs = sess.conns.pop(cid, None)
+                        if cs and cs.writer:
+                            try: cs.writer.close()
+                            except: pass
+                    await response.write((json.dumps({"t": "close", "id": cid}) + "\n").encode())
+            except Exception: pass
 
-    return web.json_response({"frames": out_frames})
+    await response.write_eof()
+    return response
 
 async def _gc_loop():
     while True:
@@ -162,7 +187,7 @@ async def _gc_loop():
 async def create_app() -> web.Application:
     app = web.Application(client_max_size=512 * 1024 * 1024)
     app.router.add_post("/tunnel", handle_tunnel)
-    async def _startup(app): asyncio.create_task(_gc_loop())
+    async def _startup(a): asyncio.create_task(_gc_loop())
     app.on_startup.append(_startup)
     return app
 

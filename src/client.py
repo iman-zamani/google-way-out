@@ -10,7 +10,6 @@ import time
 import uuid
 import os
 import datetime
-import zlib
 from urllib.parse import urlparse
 from typing import Dict, Optional, Tuple
 
@@ -19,15 +18,7 @@ from typing import Dict, Optional, Tuple
 SERVER_URL    = "https://script.google.com/macros/s/your-GAS-path/exec" # <--- change this 
 VPS_URL       = "http://VPS_IP/tunnel"                                  # <--- change this 
 
-# Pool of known Google IPs. If one is blocked, the client will rotate automatically.
-GOOGLE_IPS = [
-    "216.239.38.120", 
-    "216.239.32.21",  
-    "216.239.34.21",  
-    "216.239.36.21",  
-    "142.250.181.206",
-    "172.217.16.206"
-]
+GOOGLE_IP     = "216.239.38.120"
 SNI_HOST      = "www.google.com"
 
 SOCKS5_HOST   = "127.0.0.1"
@@ -40,6 +31,7 @@ BYPASS_EXACT_DOMAINS = {"mail.google.com", "www.google.com", "google.com"}
 BYPASS_SUFFIXES = (".ir",)
 
 POST_TIMEOUT  = 35
+# OPTIMIZATION 1: Allow massive client-side reads
 CHUNK_SIZE    = 1048576 
 SESSION_ID    = str(uuid.uuid4())
 AUTH_TOKEN    = ""
@@ -139,22 +131,15 @@ class KeepAliveClient:
         self.reader = None
         self.writer = None
         self.lock = asyncio.Lock()
-        self.ip_index = 0
 
     async def _connect(self):
-        ip = GOOGLE_IPS[self.ip_index]
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         ctx.set_alpn_protocols(["http/1.1"])
-        try:
-            self.reader, self.writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, 443, ssl=ctx, server_hostname=SNI_HOST), timeout=15.0
-            )
-        except Exception as e:
-            # If IP is blocked, rotate to the next one automatically
-            self.ip_index = (self.ip_index + 1) % len(GOOGLE_IPS)
-            raise e
+        self.reader, self.writer = await asyncio.wait_for(
+            asyncio.open_connection(GOOGLE_IP, 443, ssl=ctx, server_hostname=SNI_HOST), timeout=15.0
+        )
 
     def _close(self):
         if self.writer:
@@ -162,6 +147,7 @@ class KeepAliveClient:
             except: pass
         self.writer, self.reader = None, None
 
+    # OPTIMIZATION 3: Return an asynchronous generator to yield frames line-by-line
     async def stream_post(self, url: str, payload: dict, timeout: float):
         parsed = urlparse(url)
         path = parsed.path + ("?" + parsed.query if parsed.query else "")
@@ -187,6 +173,7 @@ class KeepAliveClient:
                     status, headers, rest = await _read_response_headers(self.reader, timeout)
                     closed_by_server = headers.get("connection", "").lower() == "close"
 
+                    # Handle 302 Redirects
                     for _ in range(3):
                         if status not in (301, 302, 303, 307, 308): break
                         loc = headers.get("location", "")
@@ -228,6 +215,7 @@ class KeepAliveClient:
                         else:
                             async for c in _read_until_eof(self.reader, rest, timeout): yield c
 
+                    # Parse frames on-the-fly and yield instantly
                     async for chunk in fill_buffer():
                         line_buf.extend(chunk)
                         while b"\n" in line_buf:
@@ -391,9 +379,7 @@ class TunnelClient:
             try:
                 sent_something, rcvd_something = await self._poll()
             except Exception as e:
-                # Log explicitly with the exception type so it's not a blank string
-                err_type = type(e).__name__
-                log.error(f"poll exception: [{err_type}] {e} (Trying next IP if blocked)")
+                log.error(f"poll exception: {e}")
                 await asyncio.sleep(1.0) 
 
             last_poll_end = time.monotonic()
@@ -418,8 +404,8 @@ class TunnelClient:
                     opened_cids.append(cid)
                 if c.outbuf:
                     snapshot = bytes(c.outbuf)
-                    comp = zlib.compress(snapshot, level=6)
-                    frames.append({"t": "data", "id": cid, "d": base64.b64encode(comp).decode()})
+                    # REMOVED ZLIB: Encode raw snapshot directly to Base64
+                    frames.append({"t": "data", "id": cid, "d": base64.b64encode(snapshot).decode()})
                     saved_data[cid] = snapshot
                     c.outbuf.clear()
                 if c.local_eof and not c.want_open:
@@ -439,6 +425,7 @@ class TunnelClient:
         rcvd_something = False
 
         try:
+            # OPTIMIZATION 3: Process JSONL stream as it arrives
             async for f in self.http.stream_post(self.url, proxy_payload, POST_TIMEOUT):
                 rcvd_something = True
                 ft, cid = f.get("t"), f.get("id")
@@ -446,9 +433,8 @@ class TunnelClient:
 
                 if ft == "data" and c:
                     try:
+                        # REMOVED ZLIB: Decode Base64 directly to raw bytes
                         raw = base64.b64decode(f["d"])
-                        try: raw = zlib.decompress(raw)
-                        except Exception: pass
                         c.writer.write(raw)
                         await c.writer.drain()
                     except Exception: pass
@@ -464,6 +450,7 @@ class TunnelClient:
                     if cid in self.conns: self.conns[cid].outbuf[0:0] = data
             raise e
 
+        # Quota Logic mapped to a successful invocation
         self.requests_today += 1
         if self.requests_today % 100 == 0:
             self._save_quota() 

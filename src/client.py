@@ -35,7 +35,7 @@ MAX_IDLE_DELAY  = 4.5  # Backoff time when completely idle
 # ------------------------------------
 
 # --- BYPASS CONFIGURATION ---
-BYPASS_EXACT_DOMAINS = {"mail.google.com", "www.google.com", "ssl.gstatic.com", "google.com"}
+BYPASS_EXACT_DOMAINS = {"mail.google.com", "www.google.com", "google.com"}
 BYPASS_SUFFIXES = (".ir",)
 # ----------------------------
 

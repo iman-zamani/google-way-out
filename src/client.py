@@ -14,8 +14,13 @@ from urllib.parse import urlparse
 from typing import Dict, Optional, Tuple
 
 # ── configuration ──────────────────────────────────────────────────────────────
-SERVER_URL    = "https://script.google.com/macros/s/your-GAS-path/exec" # <--- change this 
-VPS_URL       = "http://VPS_IP/tunnel"                                  # <--- change this                 
+# Replace with your list of Google Apps Script deployment URLs
+SERVER_URLS = [
+    "https://script.google.com/macros/s/your-GAS-path-1/exec",     # <-- change this 
+    "https://script.google.com/macros/s/your-GAS-path-2/exec",     # <-- change this 
+]
+
+VPS_URL       = "http://VPS_IP/tunnel"                             # <-- change this                           
 GOOGLE_IPS = [
     "216.239.38.120", 
     "216.239.32.21",  
@@ -235,8 +240,12 @@ class KeepAlivePool:
 # ── tunnel client ──────────────────────────────────────────────────────────────
 
 class TunnelClient:
-    def __init__(self, server_url: str, socks_host: str, socks_port: int):
-        self.url        = server_url
+    def __init__(self, server_urls: list, socks_host: str, socks_port: int):
+        self.urls       = server_urls
+        self.active_urls = list(server_urls)
+        self.url_idx    = 0
+        self.url_lock   = asyncio.Lock()
+        
         self.socks_host = socks_host
         self.socks_port = socks_port
         self.conns: Dict[int, Conn] = {}
@@ -267,6 +276,22 @@ class TunnelClient:
                 json.dump({"date": datetime.date.today().isoformat(), "count": self.requests_today}, f)
         except Exception: pass
 
+    async def _get_next_url(self) -> str:
+        """Thread-safe Round-Robin load balancer for active GAS URLs"""
+        async with self.url_lock:
+            if not self.active_urls:
+                raise Exception("All Google Apps Script URLs have been exhausted!")
+            url = self.active_urls[self.url_idx % len(self.active_urls)]
+            self.url_idx += 1
+            return url
+
+    async def _ban_url(self, url: str):
+        """Circuit breaker: Removes a failing URL from rotation for the rest of the session"""
+        async with self.url_lock:
+            if url in self.active_urls:
+                self.active_urls.remove(url)
+                log.warning(f"Circuit Breaker triggered: Banned URL {url}. {len(self.active_urls)} active URLs remaining.")
+
     def _next_id(self) -> int:
         self._nid += 1
         return self._nid
@@ -277,7 +302,6 @@ class TunnelClient:
         return False
 
     async def _socks5(self, reader, writer) -> Optional[tuple]:
-        # (SOCKS5 implementation unchanged)
         try:
             hdr = await asyncio.wait_for(reader.readexactly(2), 15)
             if hdr[0] != 5: return None
@@ -436,26 +460,41 @@ class TunnelClient:
         self.requests_today += 1
         if self.requests_today % 100 == 0:
             self._save_quota() 
-            remaining = max(0, 20000 - self.requests_today)
             now = time.monotonic()
             avg_time = (now - self.last_100_time) / 100.0
             self.last_100_time = now
-            log.info(f"📊 QUOTA: {self.requests_today}/20000 (~{remaining} left). Avg gap: {avg_time:.2f}s/req")
+            log.info(f"📊 Global Activity: {self.requests_today} requests sent today across all URLs. Avg gap: {avg_time:.2f}s/req")
 
         payload = {
             "target": VPS_URL, "token": AUTH_TOKEN,
             "body": {"sid": SESSION_ID, "frames": frames},
         }
 
-        # Borrow from pool
-        http_client = await self.http_pool.queue.get()
-        try:
-            async for f in http_client.stream_post(self.url, payload, POST_TIMEOUT):
-                asyncio.create_task(self._handle_rx_frame(f))
-        except Exception as e:
-            log.error(f"POST Error: {e}")
-        finally:
-            self.http_pool.queue.put_nowait(http_client)
+        while True:
+            try:
+                target_url = await self._get_next_url()
+            except Exception as e:
+                log.critical(f"FATAL: {e}")
+                # Cleanly shutdown the script since we have zero quotas left
+                os._exit(1)
+
+            # Borrow socket from the KeepAlive Pool
+            http_client = await self.http_pool.queue.get()
+            success = False
+            
+            try:
+                async for f in http_client.stream_post(target_url, payload, POST_TIMEOUT):
+                    asyncio.create_task(self._handle_rx_frame(f))
+                success = True
+            except Exception as e:
+                log.error(f"POST Error on {target_url}: {e}")
+                await self._ban_url(target_url)
+                # Success remains False, loop will grab the next active URL and retry sending the exact same frames.
+            finally:
+                self.http_pool.queue.put_nowait(http_client)
+            
+            if success:
+                break
 
     async def _poll_loop(self):
         current_delay = FORCE_MIN_DELAY
@@ -486,7 +525,7 @@ class TunnelClient:
 
             frames = await self._gather_frames()
             
-            # Fire concurrent POST
+            # Fire concurrent POST (Dispatched independently)
             if frames or (time.monotonic() - last_post_time) >= current_delay:
                 asyncio.create_task(self._do_post(frames))
                 last_post_time = time.monotonic()
@@ -495,11 +534,11 @@ class TunnelClient:
         server = await asyncio.start_server(self._handle_local, self.socks_host, self.socks_port)
         log.info(f"SOCKS5      → {self.socks_host}:{self.socks_port}")
         log.info(f"Active Polling Delay: {FORCE_MIN_DELAY}s (Concurrent Enabled)")
-        log.info(f"Starting Session... Today's Request Count: {self.requests_today}")
+        log.info(f"Starting Session... Load balancing across {len(self.urls)} Google Accounts.")
         
         asyncio.create_task(self._poll_loop())
         async with server: await server.serve_forever()
 
 if __name__ == "__main__":
-    try: asyncio.run(TunnelClient(SERVER_URL, SOCKS5_HOST, SOCKS5_PORT).run())
+    try: asyncio.run(TunnelClient(SERVER_URLS, SOCKS5_HOST, SOCKS5_PORT).run())
     except KeyboardInterrupt: log.info("Stopped.")

@@ -14,10 +14,8 @@ from urllib.parse import urlparse
 from typing import Dict, Optional, Tuple
 
 # ── configuration ──────────────────────────────────────────────────────────────
-
 SERVER_URL    = "https://script.google.com/macros/s/your-GAS-path/exec" # <--- change this 
-VPS_URL       = "http://VPS_IP/tunnel"                                  # <--- change this 
-
+VPS_URL       = "http://VPS_IP/tunnel"                                  # <--- change this                 
 GOOGLE_IPS = [
     "216.239.38.120", 
     "216.239.32.21",  
@@ -31,8 +29,9 @@ SNI_HOST      = "www.google.com"
 SOCKS5_HOST   = "127.0.0.1"
 SOCKS5_PORT   = 1080
 
-FORCE_MIN_DELAY = 0.3  
+FORCE_MIN_DELAY = 2.5  
 MAX_IDLE_DELAY  = 4.5  
+CONCURRENT_POSTS = 5
 
 BYPASS_EXACT_DOMAINS = {"mail.google.com", "www.google.com", "google.com"}
 BYPASS_SUFFIXES = (".ir",)
@@ -48,7 +47,8 @@ log = logging.getLogger("tunnel.client")
 # ── per-connection state ───────────────────────────────────────────────────────
 
 class Conn:
-    __slots__ = ("cid", "reader", "writer", "host", "port", "outbuf", "want_open", "local_eof")
+    __slots__ = ("cid", "reader", "writer", "host", "port", "outbuf", 
+                 "want_open", "local_eof", "tx_seq", "rx_seq", "rx_buffer", "closed_sent")
     def __init__(self, cid, reader, writer, host, port):
         self.cid        = cid
         self.reader     = reader
@@ -58,8 +58,15 @@ class Conn:
         self.outbuf     = bytearray()
         self.want_open  = True
         self.local_eof  = False
+        
+        # Sequence Number Tracking & Reassembly Buffer
+        self.tx_seq     = 0
+        self.rx_seq     = 0
+        self.rx_buffer  = {}
+        self.closed_sent = False
 
 # ── HTTP Stream Readers ────────────────────────────────────────────────────────
+# (Unchanged from original)
 
 async def _read_response_headers(reader, timeout):
     buf = bytearray()
@@ -68,21 +75,12 @@ async def _read_response_headers(reader, timeout):
         if not chunk: break
         buf.extend(chunk)
     if b"\r\n\r\n" not in buf: return 0, {}, b""
-    
     idx = buf.index(b"\r\n\r\n")
-    header_raw = buf[:idx]
-    rest = buf[idx + 4:]
-    
-    lines = header_raw.split(b"\r\n")
+    lines = buf[:idx].split(b"\r\n")
     try: status = int(lines[0].decode(errors="ignore").split()[1])
-    except (IndexError, ValueError): return 0, {}, b""
-        
-    headers = {}
-    for ln in lines[1:]:
-        if b":" in ln:
-            k, _, v = ln.partition(b":")
-            headers[k.strip().lower().decode(errors="ignore")] = v.strip().decode(errors="ignore")
-    return status, headers, bytes(rest)
+    except: return 0, {}, b""
+    headers = {ln.partition(b":")[0].strip().lower().decode(errors="ignore"): ln.partition(b":")[2].strip().decode(errors="ignore") for ln in lines[1:] if b":" in ln}
+    return status, headers, bytes(buf[idx + 4:])
 
 async def _read_chunked(reader, rest, timeout):
     cbuf = rest
@@ -91,26 +89,15 @@ async def _read_chunked(reader, rest, timeout):
             c = await asyncio.wait_for(reader.read(8192), timeout)
             if not c: return
             cbuf += c
-        
         idx = cbuf.index(b"\r\n")
-        size_hex = cbuf[:idx].decode(errors="ignore").split(";")[0].strip()
+        try: size = int(cbuf[:idx].decode(errors="ignore").split(";")[0].strip(), 16)
+        except: break
         cbuf = cbuf[idx + 2:]
-        
-        try: size = int(size_hex, 16)
-        except ValueError: break
-        
-        if size == 0:
-            while b"\r\n" not in cbuf:
-                c = await asyncio.wait_for(reader.read(8192), timeout)
-                if not c: break
-                cbuf += c
-            break
-            
+        if size == 0: break
         while len(cbuf) < size + 2:
             c = await asyncio.wait_for(reader.read(8192), timeout)
             if not c: return
             cbuf += c
-            
         yield cbuf[:size]
         cbuf = cbuf[size + 2:]
 
@@ -159,7 +146,6 @@ class KeepAliveClient:
             except: pass
         self.writer, self.reader = None, None
 
-    # RESTORED: Async Generator streaming JSONL line-by-line
     async def stream_post(self, url: str, payload: dict, timeout: float):
         parsed = urlparse(url)
         path = parsed.path + ("?" + parsed.query if parsed.query else "")
@@ -240,6 +226,11 @@ class KeepAliveClient:
                     self._close()
                     if attempt == 1: raise e
 
+class KeepAlivePool:
+    def __init__(self, size: int):
+        self.queue = asyncio.Queue()
+        for _ in range(size):
+            self.queue.put_nowait(KeepAliveClient())
 
 # ── tunnel client ──────────────────────────────────────────────────────────────
 
@@ -251,12 +242,14 @@ class TunnelClient:
         self.conns: Dict[int, Conn] = {}
         self._nid       = 0
         self._lock      = asyncio.Lock()
-        self.http       = KeepAliveClient()
+        
+        self.http_pool  = KeepAlivePool(size=CONCURRENT_POSTS)
         self.wakeup_event = asyncio.Event()  
         
         self.quota_file = "gas_quota.json"
         self.requests_today = self._load_quota()
         self.last_100_time = time.monotonic() 
+        self.last_activity = time.monotonic()
 
     def _load_quota(self) -> int:
         try:
@@ -284,6 +277,7 @@ class TunnelClient:
         return False
 
     async def _socks5(self, reader, writer) -> Optional[tuple]:
+        # (SOCKS5 implementation unchanged)
         try:
             hdr = await asyncio.wait_for(reader.readexactly(2), 15)
             if hdr[0] != 5: return None
@@ -351,7 +345,6 @@ class TunnelClient:
             writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
 
-            # 0-RTT Catching: Wait 50ms for early Client Hello/initial payload
             try:
                 early_data = await asyncio.wait_for(reader.read(CHUNK_SIZE), timeout=0.05)
                 if early_data:
@@ -360,7 +353,7 @@ class TunnelClient:
                 else:
                     conn.local_eof = True
             except asyncio.TimeoutError:
-                pass # Normal, no 0-RTT data sent
+                pass 
 
             self.wakeup_event.set()
             await self._drain_local(conn)
@@ -385,101 +378,61 @@ class TunnelClient:
             conn.local_eof = True
             self.wakeup_event.set()
 
-    async def _poll_loop(self):
-        current_delay = FORCE_MIN_DELAY
-        last_poll_end = 0.0
-
-        while True:
-            self.wakeup_event.clear()
-            now = time.monotonic()
-            time_since_last = now - last_poll_end
-            if time_since_last < FORCE_MIN_DELAY: await asyncio.sleep(FORCE_MIN_DELAY - time_since_last)
-
-            sent_something, rcvd_something = False, False
-            try:
-                sent_something, rcvd_something = await self._poll()
-            except Exception as e:
-                err_type = type(e).__name__
-                log.error(f"poll exception: [{err_type}] {e} (Trying next IP if blocked)")
-                await asyncio.sleep(1.0) 
-
-            last_poll_end = time.monotonic()
-
-            if sent_something or rcvd_something: current_delay = FORCE_MIN_DELAY
-            else: current_delay = min(MAX_IDLE_DELAY, current_delay + 0.2)
-
-            now = time.monotonic()
-            time_to_sleep = current_delay - (now - last_poll_end)
-            
-            if time_to_sleep > 0:
-                try: await asyncio.wait_for(self.wakeup_event.wait(), timeout=time_to_sleep)
-                except asyncio.TimeoutError: pass
-
-    async def _poll(self) -> Tuple[bool, bool]:
-        frames, to_close, opened_cids, saved_data = [], [], [], {}
-
+    async def _gather_frames(self) -> list:
+        frames = []
         async with self._lock:
             for cid, c in list(self.conns.items()):
                 if c.want_open:
-                    frame = {"t": "open", "id": cid, "h": c.host, "p": c.port}
-                    # 0-RTT Injection: Pack initial data into the Open frame to save a round-trip
+                    frame = {"t": "open", "id": cid, "h": c.host, "p": c.port, "seq": c.tx_seq}
                     if c.outbuf:
-                        snapshot = bytes(c.outbuf)
-                        frame["d"] = base64.b64encode(snapshot).decode()
-                        saved_data[cid] = snapshot
+                        frame["d"] = base64.b64encode(bytes(c.outbuf)).decode()
                         c.outbuf.clear()
-                    
                     frames.append(frame)
-                    opened_cids.append(cid)
-                    
+                    c.tx_seq += 1
+                    c.want_open = False
                 elif c.outbuf:
-                    snapshot = bytes(c.outbuf)
-                    frames.append({"t": "data", "id": cid, "d": base64.b64encode(snapshot).decode()})
-                    saved_data[cid] = snapshot
+                    frames.append({"t": "data", "id": cid, "seq": c.tx_seq, "d": base64.b64encode(bytes(c.outbuf)).decode()})
+                    c.tx_seq += 1
                     c.outbuf.clear()
+                
+                if c.local_eof and not c.closed_sent and not c.want_open:
+                    frames.append({"t": "close", "id": cid, "seq": c.tx_seq})
+                    c.tx_seq += 1
+                    c.closed_sent = True
                     
-                if c.local_eof and not c.want_open:
-                    frames.append({"t": "close", "id": cid})
-                    to_close.append(cid)
-                    
-            for cid in to_close:
-                self.conns.pop(cid, None)
+        return frames
 
-        if not frames and not self.conns:
-            return False, False
+    async def _process_rx_frame(self, c: Conn, f: dict):
+        ft = f.get("t")
+        if ft == "data" and "d" in f:
+            try:
+                c.writer.write(base64.b64decode(f["d"]))
+            except Exception: pass
+        elif ft in ("close", "error"):
+            try: c.writer.close()
+            except Exception: pass
+            self.conns.pop(c.cid, None)
 
-        proxy_payload = {
-            "target": VPS_URL, "token": AUTH_TOKEN,
-            "body": {"sid": SESSION_ID, "frames": frames},
-        }
+    async def _handle_rx_frame(self, f: dict):
+        self.last_activity = time.monotonic()
+        cid = f.get("id")
+        seq = f.get("seq")
+        
+        async with self._lock:
+            c = self.conns.get(cid)
+            if not c: return
+            
+            if seq is not None:
+                c.rx_buffer[seq] = f
+                # Strict Reassembly Logic
+                while c.rx_seq in c.rx_buffer:
+                    curr_f = c.rx_buffer.pop(c.rx_seq)
+                    await self._process_rx_frame(c, curr_f)
+                    c.rx_seq += 1
+            else:
+                await self._process_rx_frame(c, f)
 
-        rcvd_something = False
-
-        try:
-            # RESTORED: Stream lines dynamically
-            async for f in self.http.stream_post(self.url, proxy_payload, POST_TIMEOUT):
-                rcvd_something = True
-                ft, cid = f.get("t"), f.get("id")
-                async with self._lock: c = self.conns.get(cid)
-
-                if ft == "data" and c:
-                    try:
-                        raw = base64.b64decode(f["d"])
-                        c.writer.write(raw)
-                        await c.writer.drain()
-                    except Exception: pass
-                elif ft in ("error", "close"):
-                    async with self._lock: c = self.conns.pop(cid, None)
-                    if c:
-                        try: c.writer.close()
-                        except Exception: pass
-
-        except Exception as e:
-            async with self._lock:
-                for cid, data in saved_data.items():
-                    if cid in self.conns: self.conns[cid].outbuf[0:0] = data
-            raise e
-
+    async def _do_post(self, frames: list):
         self.requests_today += 1
         if self.requests_today % 100 == 0:
             self._save_quota() 
@@ -489,16 +442,59 @@ class TunnelClient:
             self.last_100_time = now
             log.info(f"📊 QUOTA: {self.requests_today}/20000 (~{remaining} left). Avg gap: {avg_time:.2f}s/req")
 
-        async with self._lock:
-            for cid in opened_cids:
-                if cid in self.conns: self.conns[cid].want_open = False
+        payload = {
+            "target": VPS_URL, "token": AUTH_TOKEN,
+            "body": {"sid": SESSION_ID, "frames": frames},
+        }
 
-        return len(frames) > 0, rcvd_something
+        # Borrow from pool
+        http_client = await self.http_pool.queue.get()
+        try:
+            async for f in http_client.stream_post(self.url, payload, POST_TIMEOUT):
+                asyncio.create_task(self._handle_rx_frame(f))
+        except Exception as e:
+            log.error(f"POST Error: {e}")
+        finally:
+            self.http_pool.queue.put_nowait(http_client)
+
+    async def _poll_loop(self):
+        current_delay = FORCE_MIN_DELAY
+        last_post_time = 0.0
+
+        while True:
+            self.wakeup_event.clear()
+            now = time.monotonic()
+            
+            if (now - self.last_activity) < 5.0:
+                current_delay = FORCE_MIN_DELAY
+            else:
+                current_delay = min(MAX_IDLE_DELAY, current_delay + 0.5)
+
+            time_since_last_post = now - last_post_time
+            time_to_wait = max(0, current_delay - time_since_last_post)
+
+            if time_to_wait > 0:
+                try:
+                    await asyncio.wait_for(self.wakeup_event.wait(), timeout=time_to_wait)
+                except asyncio.TimeoutError:
+                    pass
+            
+            # Ensure hard-limit on minimum delay
+            now = time.monotonic()
+            if now - last_post_time < FORCE_MIN_DELAY:
+                await asyncio.sleep(FORCE_MIN_DELAY - (now - last_post_time))
+
+            frames = await self._gather_frames()
+            
+            # Fire concurrent POST
+            if frames or (time.monotonic() - last_post_time) >= current_delay:
+                asyncio.create_task(self._do_post(frames))
+                last_post_time = time.monotonic()
 
     async def run(self):
         server = await asyncio.start_server(self._handle_local, self.socks_host, self.socks_port)
-        log.info(f"SOCKS5     → {self.socks_host}:{self.socks_port}")
-        log.info(f"Speed Limit Check: FORCE_MIN_DELAY is set to {FORCE_MIN_DELAY}s")
+        log.info(f"SOCKS5      → {self.socks_host}:{self.socks_port}")
+        log.info(f"Active Polling Delay: {FORCE_MIN_DELAY}s (Concurrent Enabled)")
         log.info(f"Starting Session... Today's Request Count: {self.requests_today}")
         
         asyncio.create_task(self._poll_loop())

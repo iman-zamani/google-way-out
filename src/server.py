@@ -20,18 +20,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [SERVER] %(message)s
 log = logging.getLogger("tunnel.server")
 
 class ConnState:
-    __slots__ = ("reader", "writer", "ready", "failed", "pending_data", "outbound_buf", "remote_eof", "read_task")
+    __slots__ = ("reader", "writer", "ready", "failed", "pending_data", 
+                 "outbound_buf", "remote_eof", "read_task", "tx_seq", 
+                 "rx_seq", "rx_buffer", "closed_sent")
     def __init__(self):
         self.reader = None
         self.writer = None
         self.ready = False
         self.failed = False
-        # Remote-to-Client background buffer (The "Sponge")
         self.pending_data = bytearray()
-        # Client-to-Remote buffer (used for 0-RTT payload buffering)
         self.outbound_buf = bytearray()
         self.remote_eof = False
         self.read_task = None
+        
+        self.tx_seq = 0
+        self.rx_seq = 0
+        self.rx_buffer = {}
+        self.closed_sent = False
 
 class SessionState:
     def __init__(self):
@@ -51,17 +56,15 @@ async def _get_session(sid: str) -> SessionState:
     return s
 
 async def _background_reader(sess: SessionState, cid: int, cs: ConnState):
-    """Continuously reads from the remote socket and buffers it in user-space."""
     try:
         while True:
-            # Hard Cap: Pause reading if buffer exceeds 5MB
             if len(cs.pending_data) > 5242880:
                 await asyncio.sleep(0.1)
                 continue
 
             chunk = await cs.reader.read(65536)
             if not chunk:
-                break # EOF reached
+                break
 
             async with sess.lock:
                 cs.pending_data.extend(chunk)
@@ -71,7 +74,6 @@ async def _background_reader(sess: SessionState, cid: int, cs: ConnState):
         async with sess.lock:
             cs.remote_eof = True
 
-# Fix 2: Helper to prevent writer.drain() deadlocks from slow upstream servers
 async def _safe_write(writer, raw):
     try:
         writer.write(raw)
@@ -96,87 +98,93 @@ async def _connect_task(sess: SessionState, cid: int, host: str, port: int):
             
         cs.reader, cs.writer, cs.ready = r, w, True
         
-        # 0-RTT Execution: Grab data the client sent in the 'open' frame
         if cs.outbound_buf:
             pending = bytes(cs.outbound_buf)
             cs.outbound_buf.clear()
             
-        # Spawn the continuous background reader
         cs.read_task = asyncio.create_task(_background_reader(sess, cid, cs))
 
-    # Flush 0-RTT outbound data immediately upon connection (non-blocking)
     if pending:
         asyncio.create_task(_safe_write(w, pending))
+
+def _process_frame_server(sess, cid, cs, f, new_connects, writes_todo):
+    ft = f.get("t")
+    if ft == "open":
+        if "d" in f:
+            cs.outbound_buf.extend(base64.b64decode(f["d"]))
+        new_connects.append((cid, f.get("h", ""), int(f.get("p", 0))))
+    elif ft == "data":
+        raw = base64.b64decode(f["d"])
+        if cs.ready:
+            writes_todo.append((cs.writer, raw))
+        elif not cs.failed:
+            cs.outbound_buf.extend(raw)
+    elif ft == "close":
+        if cs.read_task: cs.read_task.cancel()
+        if cs.writer:
+            try: cs.writer.close()
+            except: pass
 
 async def handle_tunnel(req: web.Request) -> web.Response:
     try: body = await req.json()
     except: return web.Response(status=400)
 
     sid, frames = body.get("sid", "__anon__"), body.get("frames", [])
-    if frames:
-        log.info(f"Received request with {len(frames)} frames for session [{sid[:8]}]")
-
     sess = await _get_session(sid)
     new_connects, writes_todo = [], []
 
-    # JSONL Stream Response
     response = web.StreamResponse()
     response.content_type = 'application/jsonl'
     await response.prepare(req)
 
-    # 1. Process Incoming Client Data & Commands
+    # 1. Process Incoming Client Data with Reassembly Buffering
     async with sess.lock:
         for f in sess.error_queue:
             await response.write((json.dumps(f) + "\n").encode())
         sess.error_queue.clear()
         
         for f in frames:
-            ft, cid = f.get("t"), f.get("id")
-            if ft == "open":
-                sess.conns[cid] = ConnState()
-                cs = sess.conns[cid]
-                # 0-RTT Reception: Buffer early data payload if it exists
-                if "d" in f:
-                    cs.outbound_buf.extend(base64.b64decode(f["d"]))
-                new_connects.append((cid, f.get("h", ""), int(f.get("p", 0))))
-                
-            elif ft == "data":
+            cid = f.get("id")
+            seq = f.get("seq")
+            ft  = f.get("t")
+            
+            if cid is None: continue
+
+            if seq is not None:
+                if ft == "open" and cid not in sess.conns:
+                    sess.conns[cid] = ConnState()
                 cs = sess.conns.get(cid)
                 if cs:
-                    raw = base64.b64decode(f["d"])
-                    if cs.ready: writes_todo.append((cs.writer, raw))
-                    elif not cs.failed: cs.outbound_buf.extend(raw)
-                    
-            elif ft == "close":
-                cs = sess.conns.pop(cid, None)
-                if cs:
-                    if cs.read_task: cs.read_task.cancel()
-                    if cs.writer:
-                        try: cs.writer.close()
-                        except: pass
+                    cs.rx_buffer[seq] = f
+                    # Strict In-Order Processing
+                    while cs.rx_seq in cs.rx_buffer:
+                        curr_f = cs.rx_buffer.pop(cs.rx_seq)
+                        _process_frame_server(sess, cid, cs, curr_f, new_connects, writes_todo)
+                        cs.rx_seq += 1
+            else:
+                # Handle unsequenced backwards compatibility gracefully
+                if ft == "open" and cid not in sess.conns:
+                    sess.conns[cid] = ConnState()
+                cs = sess.conns.get(cid)
+                if cs: _process_frame_server(sess, cid, cs, f, new_connects, writes_todo)
 
     # 2. Execute Connections & Writes
     for cid, host, port in new_connects: 
         asyncio.create_task(_connect_task(sess, cid, host, port))
     
-    # Fix 2: Spawn background tasks instead of awaiting sequentially
     for writer, raw in writes_todo:
         asyncio.create_task(_safe_write(writer, raw))
 
-    # Micro-pause to allow new connections/background readers to ingest initial data
     await asyncio.sleep(0.05)
 
-    # 3. Slice up to 3MB globally from the Background Sponge Buffer
+    # 3. Slice globally from the Background Buffer and Apply tx_seq
     extracts = []
-    
-    # Fix 1: Global Budget to prevent GAS memory exhaustion across multiple connections
     global_budget = 3145728 
     
     async with sess.lock:
         for cid, cs in list(sess.conns.items()):
             if not cs.ready: continue
             
-            # Slice up to remaining global budget from User-Space Memory
             extract_len = min(len(cs.pending_data), global_budget)
             data = None
             if extract_len > 0:
@@ -184,24 +192,31 @@ async def handle_tunnel(req: web.Request) -> web.Response:
                 del cs.pending_data[:extract_len]
                 global_budget -= extract_len
             
-            # Even if budget is 0, we still process the EOF closure if pending_data is empty
-            eof_close = (cs.remote_eof and len(cs.pending_data) == 0)
+            eof_close = (cs.remote_eof and len(cs.pending_data) == 0 and not cs.closed_sent)
+            
+            if data or eof_close:
+                if data:
+                    extracts.append((cid, data, False, cs.tx_seq))
+                    cs.tx_seq += 1
+                if eof_close:
+                    cs.closed_sent = True
+                    extracts.append((cid, None, True, cs.tx_seq))
+                    cs.tx_seq += 1
+            
             if eof_close:
                 if cs.writer:
                     try: cs.writer.close()
                     except: pass
                 sess.conns.pop(cid, None)
-                
-            if data or eof_close:
-                extracts.append((cid, data, eof_close))
 
-    # 4. Stream Results Back via JSONL
-    for cid, data, eof_close in extracts:
+    # 4. Stream Sequenced Results Back
+    for cid, data, eof_close, seq in extracts:
         if data:
-            out_f = {"t": "data", "id": cid, "d": base64.b64encode(data).decode()}
+            out_f = {"t": "data", "id": cid, "seq": seq, "d": base64.b64encode(data).decode()}
             await response.write((json.dumps(out_f) + "\n").encode())
-        if eof_close:
-            await response.write((json.dumps({"t": "close", "id": cid}) + "\n").encode())
+        elif eof_close:
+            out_f = {"t": "close", "id": cid, "seq": seq}
+            await response.write((json.dumps(out_f) + "\n").encode())
 
     await response.write_eof()
     return response

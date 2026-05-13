@@ -5,6 +5,7 @@ import json
 import logging
 import sys
 import time
+import random 
 from typing import Dict, List, Optional
 from aiohttp import web
 
@@ -155,6 +156,10 @@ async def handle_tunnel(req: web.Request) -> web.Response:
                     sess.conns[cid] = ConnState()
                 cs = sess.conns.get(cid)
                 if cs:
+                    # BUG 3 FIX: Drop duplicate/old sequences to prevent memory leak
+                    if seq < cs.rx_seq:
+                        continue
+
                     cs.rx_buffer[seq] = f
                     # Strict In-Order Processing
                     while cs.rx_seq in cs.rx_buffer:
@@ -177,16 +182,30 @@ async def handle_tunnel(req: web.Request) -> web.Response:
 
     await asyncio.sleep(0.05)
 
-    # 3. Slice globally from the Background Buffer and Apply tx_seq
+
+    # 3. Slice globally using Max-Min Fair Allocation (Smallest buffers first)
     extracts = []
     global_budget = 3145728 
     
     async with sess.lock:
-        for cid, cs in list(sess.conns.items()):
-            if not cs.ready: continue
+        # Get all ready connections that have data or need to send an EOF
+        active_conns = [
+            (cid, cs) for cid, cs in sess.conns.items() 
+            if cs.ready and (len(cs.pending_data) > 0 or (cs.remote_eof and not cs.closed_sent))
+        ]
+        
+        # Sort ascending by amount of pending data. 
+        # Smallest (interactive) traffic goes first, heavy downloads go last.
+        active_conns.sort(key=lambda x: len(x[1].pending_data))
+        
+        for i, (cid, cs) in enumerate(active_conns):
+            # Calculate fair share: divide the remaining budget by the remaining connections
+            remaining_conns = len(active_conns) - i
+            fair_share = global_budget // remaining_conns
             
-            extract_len = min(len(cs.pending_data), global_budget)
+            extract_len = min(len(cs.pending_data), fair_share)
             data = None
+            
             if extract_len > 0:
                 data = bytes(cs.pending_data[:extract_len])
                 del cs.pending_data[:extract_len]

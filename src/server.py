@@ -5,7 +5,7 @@ import json
 import logging
 import sys
 import time
-import random 
+import random  # BUG 1 FIX: Imported random for connection shuffling
 from typing import Dict, List, Optional
 from aiohttp import web
 

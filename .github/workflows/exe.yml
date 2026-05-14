@@ -1,7 +1,7 @@
 name: Run Server
 
 on:
-  push:
+  workflow_dispatch:
 
 permissions:
   contents: write

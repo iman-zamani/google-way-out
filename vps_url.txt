@@ -1,1 +1,1 @@
-http://bore.pub:7919/tunnel
+http://bore.pub:29596/tunnel

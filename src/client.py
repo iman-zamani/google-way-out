@@ -19,8 +19,7 @@ SERVER_URLS = [
     "https://script.google.com/macros/s/your-GAS-path-1/exec",     # <-- change this 
     "https://script.google.com/macros/s/your-GAS-path-2/exec",     # <-- change this 
 ]
-
-VPS_URL       = "http://VPS_IP/tunnel"                             # <-- change this                           
+VPS_URL       = "http://VPS_IP/tunnel"                             # <-- change this                                                
 GOOGLE_IPS = [
     "216.239.38.120", 
     "216.239.32.21",  
@@ -31,10 +30,10 @@ GOOGLE_IPS = [
 ]
 SNI_HOST      = "www.google.com"
 
-SOCKS5_HOST   = "127.0.0.1"
+SOCKS5_HOST   = "0.0.0.0"
 SOCKS5_PORT   = 1080
 
-FORCE_MIN_DELAY = 2.5  
+FORCE_MIN_DELAY = 1.5  
 MAX_IDLE_DELAY  = 4.5  
 CONCURRENT_POSTS = 5
 
@@ -49,8 +48,6 @@ AUTH_TOKEN    = ""
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [CLIENT] %(levelname)-5s %(message)s")
 log = logging.getLogger("tunnel.client")
 
-# ── per-connection state ───────────────────────────────────────────────────────
-
 class Conn:
     __slots__ = ("cid", "reader", "writer", "host", "port", "outbuf", 
                  "want_open", "local_eof", "tx_seq", "rx_seq", "rx_buffer", "closed_sent")
@@ -64,14 +61,10 @@ class Conn:
         self.want_open  = True
         self.local_eof  = False
         
-        # Sequence Number Tracking & Reassembly Buffer
         self.tx_seq     = 0
         self.rx_seq     = 0
         self.rx_buffer  = {}
         self.closed_sent = False
-
-# ── HTTP Stream Readers ────────────────────────────────────────────────────────
-# (Unchanged from original)
 
 async def _read_response_headers(reader, timeout):
     buf = bytearray()
@@ -154,7 +147,10 @@ class KeepAliveClient:
     async def stream_post(self, url: str, payload: dict, timeout: float):
         parsed = urlparse(url)
         path = parsed.path + ("?" + parsed.query if parsed.query else "")
-        body_bytes = json.dumps(payload).encode()
+        loop = asyncio.get_running_loop()
+        
+        # OFF-LOAD: Avoid blocking on huge JSON payloads serialization
+        body_bytes = await loop.run_in_executor(None, lambda: json.dumps(payload).encode())
 
         async with self.lock:
             for attempt in range(2):
@@ -222,9 +218,19 @@ class KeepAliveClient:
                         while b"\n" in line_buf:
                             line, line_buf = line_buf.split(b"\n", 1)
                             line = line.strip()
-                            if line: yield json.loads(line)
+                            if line: 
+                                # OFF-LOAD: JSON Loads logic
+                                if len(line) > 50000:
+                                    yield await loop.run_in_executor(None, json.loads, line)
+                                else:
+                                    yield json.loads(line)
                                 
-                    if line_buf.strip(): yield json.loads(line_buf.strip())
+                    if line_buf.strip():
+                        last_line = line_buf.strip()
+                        if len(last_line) > 50000:
+                            yield await loop.run_in_executor(None, json.loads, last_line)
+                        else:
+                            yield json.loads(last_line)
                     return
 
                 except Exception as e:
@@ -236,8 +242,6 @@ class KeepAlivePool:
         self.queue = asyncio.Queue()
         for _ in range(size):
             self.queue.put_nowait(KeepAliveClient())
-
-# ── tunnel client ──────────────────────────────────────────────────────────────
 
 class TunnelClient:
     def __init__(self, server_urls: list, socks_host: str, socks_port: int):
@@ -277,7 +281,6 @@ class TunnelClient:
         except Exception: pass
 
     async def _get_next_url(self) -> str:
-        """Thread-safe Round-Robin load balancer for active GAS URLs"""
         async with self.url_lock:
             if not self.active_urls:
                 raise Exception("All Google Apps Script URLs have been exhausted!")
@@ -286,7 +289,6 @@ class TunnelClient:
             return url
 
     async def _ban_url(self, url: str):
-        """Circuit breaker: Removes a failing URL from rotation for the rest of the session"""
         async with self.url_lock:
             if url in self.active_urls:
                 self.active_urls.remove(url)
@@ -351,6 +353,7 @@ class TunnelClient:
                         while True:
                             data = await src.read(CHUNK_SIZE)
                             if not data: break
+                            if dst.is_closing(): break 
                             dst.write(data)
                             await dst.drain()
                     except Exception: pass
@@ -404,18 +407,30 @@ class TunnelClient:
 
     async def _gather_frames(self) -> list:
         frames = []
+        loop = asyncio.get_running_loop()
+        
         async with self._lock:
             for cid, c in list(self.conns.items()):
                 if c.want_open:
                     frame = {"t": "open", "id": cid, "h": c.host, "p": c.port, "seq": c.tx_seq}
                     if c.outbuf:
-                        frame["d"] = base64.b64encode(bytes(c.outbuf)).decode()
+                        # OFF-LOAD: Base64 Encoding
+                        raw_buf = bytes(c.outbuf)
+                        if len(raw_buf) > 50000:
+                            frame["d"] = await loop.run_in_executor(None, lambda b: base64.b64encode(b).decode(), raw_buf)
+                        else:
+                            frame["d"] = base64.b64encode(raw_buf).decode()
                         c.outbuf.clear()
                     frames.append(frame)
                     c.tx_seq += 1
                     c.want_open = False
                 elif c.outbuf:
-                    frames.append({"t": "data", "id": cid, "seq": c.tx_seq, "d": base64.b64encode(bytes(c.outbuf)).decode()})
+                    raw_buf = bytes(c.outbuf)
+                    if len(raw_buf) > 50000:
+                        encoded = await loop.run_in_executor(None, lambda b: base64.b64encode(b).decode(), raw_buf)
+                    else:
+                        encoded = base64.b64encode(raw_buf).decode()
+                    frames.append({"t": "data", "id": cid, "seq": c.tx_seq, "d": encoded})
                     c.tx_seq += 1
                     c.outbuf.clear()
                 
@@ -429,10 +444,32 @@ class TunnelClient:
     async def _process_rx_frame(self, c: Conn, f: dict):
         ft = f.get("t")
         if ft == "data" and "d" in f:
+            # 1. STOP writing if the local socket is already closed
+            if c.writer.is_closing():
+                return
+                
             try:
-                c.writer.write(base64.b64decode(f["d"]))
-            except Exception: pass
+                # OFF-LOAD: Base64 Decoding
+                raw_b64 = f["d"]
+                if len(raw_b64) > 50000:
+                    loop = asyncio.get_running_loop()
+                    decoded_data = await loop.run_in_executor(None, base64.b64decode, raw_b64)
+                else:
+                    decoded_data = base64.b64decode(raw_b64)
+                
+                c.writer.write(decoded_data)
+                await c.writer.drain()
+                
+            except Exception: 
+                # 2. Local connection broke (e.g., user canceled download).
+                c.local_eof = True
+                try: c.writer.close()
+                except Exception: pass
+                # 3. Wake up the poller immediately to send {"t": "close"} to the server
+                self.wakeup_event.set()
+                
         elif ft in ("close", "error"):
+            c.local_eof = True
             try: c.writer.close()
             except Exception: pass
             self.conns.pop(c.cid, None)
@@ -447,8 +484,10 @@ class TunnelClient:
             if not c: return
             
             if seq is not None:
+                if seq < c.rx_seq:
+                    return
+
                 c.rx_buffer[seq] = f
-                # Strict Reassembly Logic
                 while c.rx_seq in c.rx_buffer:
                     curr_f = c.rx_buffer.pop(c.rx_seq)
                     await self._process_rx_frame(c, curr_f)
@@ -475,10 +514,8 @@ class TunnelClient:
                 target_url = await self._get_next_url()
             except Exception as e:
                 log.critical(f"FATAL: {e}")
-                # Cleanly shutdown the script since we have zero quotas left
                 os._exit(1)
 
-            # Borrow socket from the KeepAlive Pool
             http_client = await self.http_pool.queue.get()
             success = False
             
@@ -489,7 +526,15 @@ class TunnelClient:
             except Exception as e:
                 log.error(f"POST Error on {target_url}: {e}")
                 await self._ban_url(target_url)
-                # Success remains False, loop will grab the next active URL and retry sending the exact same frames.
+                async with self._lock:
+                    for failed_frame in frames:
+                        fcid = failed_frame.get("id")
+                        if fcid in self.conns:
+                            fc = self.conns[fcid]
+                            try: fc.writer.close()
+                            except Exception: pass
+                            self.conns.pop(fcid, None)
+                break
             finally:
                 self.http_pool.queue.put_nowait(http_client)
             
@@ -518,14 +563,12 @@ class TunnelClient:
                 except asyncio.TimeoutError:
                     pass
             
-            # Ensure hard-limit on minimum delay
             now = time.monotonic()
             if now - last_post_time < FORCE_MIN_DELAY:
                 await asyncio.sleep(FORCE_MIN_DELAY - (now - last_post_time))
 
             frames = await self._gather_frames()
             
-            # Fire concurrent POST (Dispatched independently)
             if frames or (time.monotonic() - last_post_time) >= current_delay:
                 asyncio.create_task(self._do_post(frames))
                 last_post_time = time.monotonic()

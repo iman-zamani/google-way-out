@@ -1,0 +1,69 @@
+name: Run Server
+
+on:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  run-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    if: github.actor != 'github-actions[bot]'
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Install bore
+        run: |
+          wget -q https://github.com/ekzhang/bore/releases/download/v0.5.1/bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz
+          tar xzf bore-v0.5.1-x86_64-unknown-linux-musl.tar.gz
+          chmod +x bore
+
+      - name: Clone google-way-out repo
+        run: |
+          git clone https://github.com/raricki/google-way-out
+
+      - name: Set up Python virtual environment
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install aiohttp
+
+      - name: Expose port 8080 via bore.pub
+        run: |
+          ./bore local 8080 --to bore.pub > bore_tunnel.log 2>&1 &
+          sleep 10
+          BORE_PORT=$(grep -oP 'listening at bore\.pub:\K\d+' bore_tunnel.log)
+          echo "BORE_PORT=$BORE_PORT" >> $GITHUB_ENV
+          echo "Bore tunnel established on bore.pub:$BORE_PORT"
+
+      - name: Commit bore port to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "http://bore.pub:$BORE_PORT/tunnel" > vps_url.txt
+          git add vps_url.txt
+          git commit -m "ci: set active bore tunnel URL"
+          git push
+
+      - name: Run server.py for 1 hour
+        run: |
+          source .venv/bin/activate
+          timeout 3600 python3 google-way-out/src/server.py 8080 || true
+
+      - name: Cleanup and disable workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull
+          git rm vps_url.txt
+          git commit -m "ci: remove bore tunnel URL after session end"
+          git push
+
+          curl -s -X PUT \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$(basename ${{ github.workflow_ref }} | cut -d@ -f1)/disable"

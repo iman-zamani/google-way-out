@@ -19,7 +19,7 @@ SERVER_URLS = [
     "https://script.google.com/macros/s/your-GAS-path-1/exec",     # <-- change this 
     "https://script.google.com/macros/s/your-GAS-path-2/exec",     # <-- change this 
 ]
-VPS_URL       = "http://VPS_IP/tunnel"                             # <-- change this                                                
+VPS_URL       = "http://VPS_IP/tunnel"                             # <-- change this                                             
 GOOGLE_IPS = [
     "216.239.38.120", 
     "216.239.32.21",  
@@ -369,11 +369,19 @@ class TunnelClient:
             conn = Conn(cid, reader, writer, host, port)
             async with self._lock: self.conns[cid] = conn
 
+            # =====================================================================
+            # TCP SPOOFING: Lie to Firefox that the connection is instantly open.
+            # We do not wait for the VPS to actually connect.
+            # =====================================================================
             writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
 
+            # =====================================================================
+            # BUNDLE WINDOW: Wait up to 0.2s for Firefox to send the TLS ClientHello.
+            # This ensures we bundle the connection request AND data in 1 payload.
+            # =====================================================================
             try:
-                early_data = await asyncio.wait_for(reader.read(CHUNK_SIZE), timeout=0.05)
+                early_data = await asyncio.wait_for(reader.read(CHUNK_SIZE), timeout=0.2)
                 if early_data:
                     async with self._lock:
                         conn.outbuf.extend(early_data)
@@ -382,7 +390,10 @@ class TunnelClient:
             except asyncio.TimeoutError:
                 pass 
 
+            # Trigger the polling loop to fire instantly
             self.wakeup_event.set()
+            
+            should_close = False
             await self._drain_local(conn)
             
         except Exception: pass
@@ -444,7 +455,6 @@ class TunnelClient:
     async def _process_rx_frame(self, c: Conn, f: dict):
         ft = f.get("t")
         if ft == "data" and "d" in f:
-            # 1. STOP writing if the local socket is already closed
             if c.writer.is_closing():
                 return
                 
@@ -461,11 +471,9 @@ class TunnelClient:
                 await c.writer.drain()
                 
             except Exception: 
-                # 2. Local connection broke (e.g., user canceled download).
                 c.local_eof = True
                 try: c.writer.close()
                 except Exception: pass
-                # 3. Wake up the poller immediately to send {"t": "close"} to the server
                 self.wakeup_event.set()
                 
         elif ft in ("close", "error"):
@@ -576,7 +584,7 @@ class TunnelClient:
     async def run(self):
         server = await asyncio.start_server(self._handle_local, self.socks_host, self.socks_port)
         log.info(f"SOCKS5      → {self.socks_host}:{self.socks_port}")
-        log.info(f"Active Polling Delay: {FORCE_MIN_DELAY}s (Concurrent Enabled)")
+        log.info(f"Active Polling Delay: {FORCE_MIN_DELAY}s (TCP Spoofing Enabled)")
         log.info(f"Starting Session... Load balancing across {len(self.urls)} Google Accounts.")
         
         asyncio.create_task(self._poll_loop())

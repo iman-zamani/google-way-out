@@ -5,12 +5,12 @@ import json
 import logging
 import sys
 import time
-import random  # BUG 1 FIX: Imported random for connection shuffling
+import random 
 from typing import Dict, List, Optional
 from aiohttp import web
 
 BIND_HOST       = "0.0.0.0"
-BIND_PORT       = 8080
+BIND_PORT       = 80
 AUTH_TOKEN      = "" 
 
 CONNECT_TIMEOUT = 8.0
@@ -127,6 +127,8 @@ def _process_frame_server(sess, cid, cs, f, new_connects, writes_todo):
             except: pass
 
 async def handle_tunnel(req: web.Request) -> web.Response:
+    start_time = time.monotonic() # <-- STOPWATCH START
+    
     try: body = await req.json()
     except: return web.Response(status=400)
 
@@ -156,18 +158,14 @@ async def handle_tunnel(req: web.Request) -> web.Response:
                     sess.conns[cid] = ConnState()
                 cs = sess.conns.get(cid)
                 if cs:
-                    # BUG 3 FIX: Drop duplicate/old sequences to prevent memory leak
                     if seq < cs.rx_seq:
                         continue
-
                     cs.rx_buffer[seq] = f
-                    # Strict In-Order Processing
                     while cs.rx_seq in cs.rx_buffer:
                         curr_f = cs.rx_buffer.pop(cs.rx_seq)
                         _process_frame_server(sess, cid, cs, curr_f, new_connects, writes_todo)
                         cs.rx_seq += 1
             else:
-                # Handle unsequenced backwards compatibility gracefully
                 if ft == "open" and cid not in sess.conns:
                     sess.conns[cid] = ConnState()
                 cs = sess.conns.get(cid)
@@ -180,26 +178,32 @@ async def handle_tunnel(req: web.Request) -> web.Response:
     for writer, raw in writes_todo:
         asyncio.create_task(_safe_write(writer, raw))
 
-    await asyncio.sleep(0.05)
+    # 3. SMART WAIT FOR SERVER RESPONSE
+    wait_cycles = 0
+    for _ in range(8):
+        await asyncio.sleep(0.05)
+        wait_cycles += 1
+        has_new_data = False
+        async with sess.lock:
+            for cid, cs in sess.conns.items():
+                if cs.ready and (len(cs.pending_data) > 0 or (cs.remote_eof and not cs.closed_sent)):
+                    has_new_data = True
+                    break
+        if has_new_data:
+            break
 
-
-    # 3. Slice globally using Max-Min Fair Allocation (Smallest buffers first)
+    # 4. Slice globally using Max-Min Fair Allocation
     extracts = []
     global_budget = 3145728 
     
     async with sess.lock:
-        # Get all ready connections that have data or need to send an EOF
         active_conns = [
             (cid, cs) for cid, cs in sess.conns.items() 
             if cs.ready and (len(cs.pending_data) > 0 or (cs.remote_eof and not cs.closed_sent))
         ]
-        
-        # Sort ascending by amount of pending data. 
-        # Smallest (interactive) traffic goes first, heavy downloads go last.
         active_conns.sort(key=lambda x: len(x[1].pending_data))
         
         for i, (cid, cs) in enumerate(active_conns):
-            # Calculate fair share: divide the remaining budget by the remaining connections
             remaining_conns = len(active_conns) - i
             fair_share = global_budget // remaining_conns
             
@@ -228,7 +232,7 @@ async def handle_tunnel(req: web.Request) -> web.Response:
                     except: pass
                 sess.conns.pop(cid, None)
 
-    # 4. Stream Sequenced Results Back
+    # 5. Stream Sequenced Results Back
     for cid, data, eof_close, seq in extracts:
         if data:
             out_f = {"t": "data", "id": cid, "seq": seq, "d": base64.b64encode(data).decode()}
@@ -238,8 +242,12 @@ async def handle_tunnel(req: web.Request) -> web.Response:
             await response.write((json.dumps(out_f) + "\n").encode())
 
     await response.write_eof()
+    
+    # <-- STOPWATCH END AND LOG
+    duration = time.monotonic() - start_time
+    log.info(f"POST resolved in {duration:.3f}s | Wait Cycles: {wait_cycles} | New TCP: {len(new_connects)} | Frames Sent: {len(extracts)}")
+    
     return response
-
 async def _gc_loop():
     while True:
         await asyncio.sleep(GC_INTERVAL)

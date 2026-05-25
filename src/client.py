@@ -20,22 +20,25 @@ SERVER_URLS = [
     "https://script.google.com/macros/s/your-GAS-path-2/exec",     # <-- change this 
 ]
 VPS_URL       = "http://VPS_IP/tunnel"                             # <-- change this                                             
-GOOGLE_IPS = [
-    "216.239.38.120", 
-    "216.239.32.21",  
-    "216.239.34.21",  
-    "216.239.36.21",  
-    "142.250.181.206",
-    "172.217.16.206"
+GOOGLE_IPS_CANDIDATES = [
+    "216.239.32.120", "216.239.34.120", "216.239.36.120", "216.239.38.120",
+    "142.250.80.142", "142.250.80.138", "142.250.179.110", "142.250.185.110",
+    "142.250.184.206", "142.250.190.238", "142.250.191.78", "172.217.1.206",
+    "172.217.14.206", "172.217.16.142", "172.217.22.174", "172.217.164.110",
+    "172.217.168.206", "172.217.169.206", "34.107.221.82", "142.251.32.110",
+    "142.251.33.110", "142.251.46.206", "142.251.46.238", "142.250.80.170",
+    "142.250.72.206", "142.250.64.206", "142.250.72.110"
 ]
-SNI_HOST      = "www.google.com"
+SNI_HOSTS = ["www.google.com", "mail.google.com", "accounts.google.com"]
 
 SOCKS5_HOST   = "0.0.0.0"
 SOCKS5_PORT   = 1080
 
 FORCE_MIN_DELAY = 1.5  
-MAX_IDLE_DELAY  = 4.5  
-CONCURRENT_POSTS = 5
+MAX_IDLE_DELAY  = 3.0  
+
+# Number of concurrent active TLS Keep-Alive connections
+POOL_SIZE = 8
 
 BYPASS_EXACT_DOMAINS = {"mail.google.com", "www.google.com", "google.com"}
 BYPASS_SUFFIXES = (".ir",)
@@ -117,28 +120,35 @@ async def _read_until_eof(reader, rest, timeout):
             yield c
         except asyncio.TimeoutError: break
 
-class KeepAliveClient:
-    def __init__(self):
+class PrewarmedConn:
+    """A persistent TLS connection reused until TTL expiry."""
+    def __init__(self, ip: str, sni: str):
+        self.ip = ip
+        self.sni = sni
         self.reader = None
         self.writer = None
-        self.lock = asyncio.Lock()
-        self.ip_index = 0
+        self.created_at = 0.0
 
-    async def _connect(self):
-        ip = GOOGLE_IPS[self.ip_index]
+    async def connect(self):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         ctx.set_alpn_protocols(["http/1.1"])
-        try:
-            self.reader, self.writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, 443, ssl=ctx, server_hostname=SNI_HOST), timeout=15.0
-            )
-        except Exception as e:
-            self.ip_index = (self.ip_index + 1) % len(GOOGLE_IPS)
-            raise e
+        
+        self.reader, self.writer = await asyncio.wait_for(
+            asyncio.open_connection(self.ip, 443, ssl=ctx, server_hostname=self.sni), 
+            timeout=5.0
+        )
+        self.created_at = time.monotonic()
 
-    def _close(self):
+    def is_healthy(self) -> bool:
+        if self.writer is None or self.writer.is_closing():
+            return False
+        if self.reader is not None and self.reader.at_eof():
+            return False
+        return True
+
+    def close(self):
         if self.writer:
             try: self.writer.close()
             except: pass
@@ -149,99 +159,156 @@ class KeepAliveClient:
         path = parsed.path + ("?" + parsed.query if parsed.query else "")
         loop = asyncio.get_running_loop()
         
-        # OFF-LOAD: Avoid blocking on huge JSON payloads serialization
         body_bytes = await loop.run_in_executor(None, lambda: json.dumps(payload).encode())
 
-        async with self.lock:
-            for attempt in range(2):
-                try:
-                    if not self.writer: await self._connect()
+        req = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {parsed.netloc}\r\n"
+            f"Content-Type: application/json\r\n"
+            f"Content-Length: {len(body_bytes)}\r\n"
+            f"Connection: keep-alive\r\n" 
+            f"\r\n"
+        ).encode() + body_bytes
 
-                    req = (
-                        f"POST {path} HTTP/1.1\r\n"
-                        f"Host: {parsed.netloc}\r\n"
-                        f"Content-Type: application/json\r\n"
-                        f"Content-Length: {len(body_bytes)}\r\n"
-                        f"Connection: keep-alive\r\n"
-                        f"\r\n"
-                    ).encode() + body_bytes
+        self.writer.write(req)
+        await self.writer.drain()
 
-                    self.writer.write(req)
-                    await self.writer.drain()
+        status, headers, rest = await _read_response_headers(self.reader, timeout)
 
-                    status, headers, rest = await _read_response_headers(self.reader, timeout)
-                    closed_by_server = headers.get("connection", "").lower() == "close"
+        for _ in range(3):
+            if status not in (301, 302, 303, 307, 308): break
+            loc = headers.get("location", "")
+            if not loc: break
 
-                    for _ in range(3):
-                        if status not in (301, 302, 303, 307, 308): break
-                        loc = headers.get("location", "")
-                        if not loc: break
+            chunked = "chunked" in headers.get("transfer-encoding", "")
+            clen = int(headers.get("content-length", "-1"))
+            if chunked:
+                async for _ in _read_chunked(self.reader, rest, timeout): pass
+            elif clen >= 0:
+                async for _ in _read_content_length(self.reader, rest, clen, timeout): pass
 
-                        chunked = "chunked" in headers.get("transfer-encoding", "")
-                        clen = int(headers.get("content-length", "-1"))
-                        if chunked:
-                            async for _ in _read_chunked(self.reader, rest, timeout): pass
-                        elif clen >= 0:
-                            async for _ in _read_content_length(self.reader, rest, clen, timeout): pass
+            p = urlparse(loc)
+            npath = p.path + ("?" + p.query if p.query else "")
+            follow_req = (f"GET {npath} HTTP/1.1\r\nHost: {p.netloc}\r\nConnection: keep-alive\r\n\r\n").encode()
 
-                        p = urlparse(loc)
-                        npath = p.path + ("?" + p.query if p.query else "")
-                        follow_req = (f"GET {npath} HTTP/1.1\r\nHost: {p.netloc}\r\nConnection: keep-alive\r\n\r\n").encode()
+            self.writer.write(follow_req)
+            await self.writer.drain()
+            status, headers, rest = await _read_response_headers(self.reader, timeout)
 
-                        self.writer.write(follow_req)
-                        await self.writer.drain()
-                        status, headers, rest = await _read_response_headers(self.reader, timeout)
-                        if headers.get("connection", "").lower() == "close": closed_by_server = True
+        if status == 0:
+            raise Exception("Empty response (connection dropped by Google)")
 
-                    if status == 0 or closed_by_server: self._close()
-                    if status == 0 and attempt == 0: continue 
+        if status != 200:
+            err = b""
+            async for c in _read_until_eof(self.reader, rest, timeout): err += c
+            raise Exception(f"HTTP {status} from relay: {err[:100].decode(errors='ignore')}")
 
-                    if status != 200:
-                        err = b""
-                        async for c in _read_until_eof(self.reader, rest, timeout): err += c
-                        raise Exception(f"HTTP {status} from relay: {err[:100].decode(errors='ignore')}")
+        chunked = "chunked" in headers.get("transfer-encoding", "")
+        content_len = int(headers.get("content-length", "-1"))
 
-                    chunked = "chunked" in headers.get("transfer-encoding", "")
-                    content_len = int(headers.get("content-length", "-1"))
+        line_buf = bytearray()
+        async def fill_buffer():
+            if chunked:
+                async for c in _read_chunked(self.reader, rest, timeout): yield c
+            elif content_len >= 0:
+                async for c in _read_content_length(self.reader, rest, content_len, timeout): yield c
+            else:
+                async for c in _read_until_eof(self.reader, rest, timeout): yield c
 
-                    line_buf = bytearray()
-                    async def fill_buffer():
-                        if chunked:
-                            async for c in _read_chunked(self.reader, rest, timeout): yield c
-                        elif content_len >= 0:
-                            async for c in _read_content_length(self.reader, rest, content_len, timeout): yield c
-                        else:
-                            async for c in _read_until_eof(self.reader, rest, timeout): yield c
+        async for chunk in fill_buffer():
+            line_buf.extend(chunk)
+            while b"\n" in line_buf:
+                line, line_buf = line_buf.split(b"\n", 1)
+                line = line.strip()
+                if line: 
+                    if len(line) > 50000:
+                        yield await loop.run_in_executor(None, json.loads, line)
+                    else:
+                        yield json.loads(line)
+                    
+        if line_buf.strip():
+            last_line = line_buf.strip()
+            if len(last_line) > 50000:
+                yield await loop.run_in_executor(None, json.loads, last_line)
+            else:
+                yield json.loads(last_line)
 
-                    async for chunk in fill_buffer():
-                        line_buf.extend(chunk)
-                        while b"\n" in line_buf:
-                            line, line_buf = line_buf.split(b"\n", 1)
-                            line = line.strip()
-                            if line: 
-                                # OFF-LOAD: JSON Loads logic
-                                if len(line) > 50000:
-                                    yield await loop.run_in_executor(None, json.loads, line)
-                                else:
-                                    yield json.loads(line)
-                                
-                    if line_buf.strip():
-                        last_line = line_buf.strip()
-                        if len(last_line) > 50000:
-                            yield await loop.run_in_executor(None, json.loads, last_line)
-                        else:
-                            yield json.loads(last_line)
-                    return
-
-                except Exception as e:
-                    self._close()
-                    if attempt == 1: raise e
-
-class KeepAlivePool:
-    def __init__(self, size: int):
+class ConnectionPool:
+    """Maintains reusable Keep-Alive TLS connections with Fast-Fail logic."""
+    def __init__(self, target_size: int, active_ips: list):
+        self.target_size = target_size
+        self.active_ips = active_ips
         self.queue = asyncio.Queue()
-        for _ in range(size):
-            self.queue.put_nowait(KeepAliveClient())
+        self.ip_idx = 0
+        self.sni_idx = 0
+        self.pending_tasks = set()
+        self.is_active = False  
+
+    def _next_target(self):
+        ip = self.active_ips[self.ip_idx % len(self.active_ips)]
+        sni = SNI_HOSTS[self.sni_idx % len(SNI_HOSTS)]
+        self.ip_idx += 1
+        self.sni_idx += 1
+        return ip, sni
+
+    async def _replenish_loop(self):
+        while True:
+            active_conns = []
+            while not self.queue.empty():
+                conn = self.queue.get_nowait()
+                if time.monotonic() - conn.created_at < 40.0 and conn.is_healthy():
+                    active_conns.append(conn)
+                else:
+                    conn.close()
+            
+            for conn in active_conns:
+                self.queue.put_nowait(conn)
+
+            if self.is_active:
+                current_count = self.queue.qsize() + len(self.pending_tasks)
+                needed = self.target_size - current_count
+                
+                if needed > 0:
+                    for _ in range(needed):
+                        ip, sni = self._next_target()
+                        task = asyncio.create_task(self._build_conn(ip, sni))
+                        self.pending_tasks.add(task)
+                        task.add_done_callback(self.pending_tasks.discard)
+            
+            await asyncio.sleep(1.0)
+
+    async def _build_conn(self, ip, sni):
+        conn = PrewarmedConn(ip, sni)
+        try:
+            await asyncio.wait_for(conn.connect(), timeout=3.5)
+            await self.queue.put(conn)
+        except Exception:
+            conn.close()
+
+    async def get(self) -> PrewarmedConn:
+        while not self.queue.empty():
+            conn = self.queue.get_nowait()
+            if time.monotonic() - conn.created_at < 40.0 and conn.is_healthy():
+                return conn
+            conn.close()
+        
+        # JIT Fallback
+        for _ in range(3):
+            ip, sni = self._next_target()
+            conn = PrewarmedConn(ip, sni)
+            try:
+                await asyncio.wait_for(conn.connect(), timeout=3.5)
+                return conn
+            except Exception:
+                conn.close()
+                
+        raise Exception("Timeout acquiring fallback connection")
+
+    def put_back(self, conn: PrewarmedConn):
+        if time.monotonic() - conn.created_at < 40.0 and conn.is_healthy():
+            self.queue.put_nowait(conn)
+        else:
+            conn.close()
 
 class TunnelClient:
     def __init__(self, server_urls: list, socks_host: str, socks_port: int):
@@ -256,8 +323,10 @@ class TunnelClient:
         self._nid       = 0
         self._lock      = asyncio.Lock()
         
-        self.http_pool  = KeepAlivePool(size=CONCURRENT_POSTS)
+        self.active_ips = [] # Filled by scanner
+        self.pool       = None # Initialized after scanner
         self.wakeup_event = asyncio.Event()  
+        self._direct_tasks = set()
         
         self.quota_file = "gas_quota.json"
         self.requests_today = self._load_quota()
@@ -279,6 +348,41 @@ class TunnelClient:
             with open(self.quota_file, "w") as f:
                 json.dump({"date": datetime.date.today().isoformat(), "count": self.requests_today}, f)
         except Exception: pass
+
+    async def scan_google_ips(self):
+        """Scans all candidate IPs concurrently and selects the fastest, unblocked ones."""
+        log.info(f"Scanning {len(GOOGLE_IPS_CANDIDATES)} Google Edge IPs...")
+        
+        async def check_ip(ip):
+            start = time.monotonic()
+            try:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                ctx.set_alpn_protocols(["http/1.1"])
+                r, w = await asyncio.wait_for(
+                    asyncio.open_connection(ip, 443, ssl=ctx, server_hostname="www.google.com"),
+                    timeout=2.0
+                )
+                w.close()
+                return ip, time.monotonic() - start
+            except Exception:
+                return ip, 999.0
+
+        results = await asyncio.gather(*[check_ip(ip) for ip in GOOGLE_IPS_CANDIDATES])
+        
+        # Filter out blocked ones and sort by speed
+        working_ips = sorted([res for res in results if res[1] < 999.0], key=lambda x: x[1])
+        
+        if not working_ips:
+            log.critical("FATAL: All Google IPs are blocked or timed out.")
+            os._exit(1)
+            
+        # Keep the top 10 fastest
+        self.active_ips = [res[0] for res in working_ips[:10]]
+        avg_ping = sum(res[1] for res in working_ips[:10]) / len(self.active_ips)
+        
+        log.info(f"Scan complete. Found {len(working_ips)} working IPs. Selected top {len(self.active_ips)} (Avg Ping: {avg_ping*1000:.0f}ms)")
 
     async def _get_next_url(self) -> str:
         async with self.url_lock:
@@ -361,25 +465,21 @@ class TunnelClient:
                         try: dst.close()
                         except Exception: pass
 
-                asyncio.create_task(relay(reader, remote_writer))
-                asyncio.create_task(relay(remote_reader, writer))
+                t1 = asyncio.create_task(relay(reader, remote_writer))
+                t2 = asyncio.create_task(relay(remote_reader, writer))
+                self._direct_tasks.add(t1)
+                self._direct_tasks.add(t2)
+                t1.add_done_callback(self._direct_tasks.discard)
+                t2.add_done_callback(self._direct_tasks.discard)
                 return
 
             cid = self._next_id()
             conn = Conn(cid, reader, writer, host, port)
             async with self._lock: self.conns[cid] = conn
 
-            # =====================================================================
-            # TCP SPOOFING: Lie to Firefox that the connection is instantly open.
-            # We do not wait for the VPS to actually connect.
-            # =====================================================================
             writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
 
-            # =====================================================================
-            # BUNDLE WINDOW: Wait up to 0.2s for Firefox to send the TLS ClientHello.
-            # This ensures we bundle the connection request AND data in 1 payload.
-            # =====================================================================
             try:
                 early_data = await asyncio.wait_for(reader.read(CHUNK_SIZE), timeout=0.2)
                 if early_data:
@@ -390,9 +490,7 @@ class TunnelClient:
             except asyncio.TimeoutError:
                 pass 
 
-            # Trigger the polling loop to fire instantly
             self.wakeup_event.set()
-            
             should_close = False
             await self._drain_local(conn)
             
@@ -425,7 +523,6 @@ class TunnelClient:
                 if c.want_open:
                     frame = {"t": "open", "id": cid, "h": c.host, "p": c.port, "seq": c.tx_seq}
                     if c.outbuf:
-                        # OFF-LOAD: Base64 Encoding
                         raw_buf = bytes(c.outbuf)
                         if len(raw_buf) > 50000:
                             frame["d"] = await loop.run_in_executor(None, lambda b: base64.b64encode(b).decode(), raw_buf)
@@ -455,11 +552,8 @@ class TunnelClient:
     async def _process_rx_frame(self, c: Conn, f: dict):
         ft = f.get("t")
         if ft == "data" and "d" in f:
-            if c.writer.is_closing():
-                return
-                
+            if c.writer.is_closing(): return
             try:
-                # OFF-LOAD: Base64 Decoding
                 raw_b64 = f["d"]
                 if len(raw_b64) > 50000:
                     loop = asyncio.get_running_loop()
@@ -469,7 +563,6 @@ class TunnelClient:
                 
                 c.writer.write(decoded_data)
                 await c.writer.drain()
-                
             except Exception: 
                 c.local_eof = True
                 try: c.writer.close()
@@ -483,7 +576,6 @@ class TunnelClient:
             self.conns.pop(c.cid, None)
 
     async def _handle_rx_frame(self, f: dict):
-        self.last_activity = time.monotonic()
         cid = f.get("id")
         seq = f.get("seq")
         
@@ -492,9 +584,7 @@ class TunnelClient:
             if not c: return
             
             if seq is not None:
-                if seq < c.rx_seq:
-                    return
-
+                if seq < c.rx_seq: return
                 c.rx_buffer[seq] = f
                 while c.rx_seq in c.rx_buffer:
                     curr_f = c.rx_buffer.pop(c.rx_seq)
@@ -517,37 +607,52 @@ class TunnelClient:
             "body": {"sid": SESSION_ID, "frames": frames},
         }
 
-        while True:
+        success = False
+        
+        for attempt in range(2):
             try:
                 target_url = await self._get_next_url()
             except Exception as e:
                 log.critical(f"FATAL: {e}")
                 os._exit(1)
 
-            http_client = await self.http_pool.queue.get()
-            success = False
-            
             try:
-                async for f in http_client.stream_post(target_url, payload, POST_TIMEOUT):
+                conn = await asyncio.wait_for(self.pool.get(), timeout=10.0)
+            except asyncio.TimeoutError:
+                log.error("Failed to fetch TLS connection: Pool starved.")
+                continue
+            except Exception as e:
+                err_type = type(e).__name__
+                log.error(f"Failed to fetch TLS connection: {err_type} {e}")
+                continue
+
+            try:
+                async for f in conn.stream_post(target_url, payload, POST_TIMEOUT):
                     asyncio.create_task(self._handle_rx_frame(f))
                 success = True
+                self.pool.put_back(conn) 
+                break 
             except Exception as e:
-                log.error(f"POST Error on {target_url}: {e}")
-                await self._ban_url(target_url)
-                async with self._lock:
-                    for failed_frame in frames:
-                        fcid = failed_frame.get("id")
-                        if fcid in self.conns:
-                            fc = self.conns[fcid]
-                            try: fc.writer.close()
-                            except Exception: pass
-                            self.conns.pop(fcid, None)
-                break
-            finally:
-                self.http_pool.queue.put_nowait(http_client)
-            
-            if success:
-                break
+                conn.close() 
+                error_msg = str(e)
+                if "HTTP" in error_msg and "HTTP 200" not in error_msg and "HTTP 30" not in error_msg:
+                    log.error(f"POST Error on {target_url}: {e}")
+                    await self._ban_url(target_url)
+                else:
+                    if attempt == 1:
+                        err_type = type(e).__name__
+                        log.debug(f"Network error on attempt {attempt+1}: {err_type} {e}")
+        
+        if not success and frames:
+            log.debug("Dropped frames due to repeated network failure.")
+            async with self._lock:
+                for failed_frame in frames:
+                    fcid = failed_frame.get("id")
+                    if fcid in self.conns:
+                        fc = self.conns[fcid]
+                        try: fc.writer.close()
+                        except Exception: pass
+                        self.conns.pop(fcid, None)
 
     async def _poll_loop(self):
         current_delay = FORCE_MIN_DELAY
@@ -555,14 +660,19 @@ class TunnelClient:
 
         while True:
             self.wakeup_event.clear()
-            now = time.monotonic()
             
-            if (now - self.last_activity) < 5.0:
-                current_delay = FORCE_MIN_DELAY
+            is_active = len(self.conns) > 0
+            self.pool.is_active = is_active
+            
+            if is_active:
+                if (time.monotonic() - self.last_activity) < 5.0:
+                    current_delay = FORCE_MIN_DELAY
+                else:
+                    current_delay = min(MAX_IDLE_DELAY, current_delay + 0.5)
             else:
-                current_delay = min(MAX_IDLE_DELAY, current_delay + 0.5)
+                current_delay = 20.0
 
-            time_since_last_post = now - last_post_time
+            time_since_last_post = time.monotonic() - last_post_time
             time_to_wait = max(0, current_delay - time_since_last_post)
 
             if time_to_wait > 0:
@@ -571,9 +681,8 @@ class TunnelClient:
                 except asyncio.TimeoutError:
                     pass
             
-            now = time.monotonic()
-            if now - last_post_time < FORCE_MIN_DELAY:
-                await asyncio.sleep(FORCE_MIN_DELAY - (now - last_post_time))
+            if (time.monotonic() - last_post_time) < FORCE_MIN_DELAY:
+                await asyncio.sleep(FORCE_MIN_DELAY - (time.monotonic() - last_post_time))
 
             frames = await self._gather_frames()
             
@@ -582,9 +691,16 @@ class TunnelClient:
                 last_post_time = time.monotonic()
 
     async def run(self):
+        # 1. Run the IP Scanner first
+        await self.scan_google_ips()
+        
+        # 2. Initialize the pool with the working IPs
+        self.pool = ConnectionPool(target_size=POOL_SIZE, active_ips=self.active_ips)
+        asyncio.create_task(self.pool._replenish_loop())
+        
         server = await asyncio.start_server(self._handle_local, self.socks_host, self.socks_port)
         log.info(f"SOCKS5      → {self.socks_host}:{self.socks_port}")
-        log.info(f"Active Polling Delay: {FORCE_MIN_DELAY}s (TCP Spoofing Enabled)")
+        log.info(f"Active Polling Delay: {FORCE_MIN_DELAY}s (Fast Chat Mode)")
         log.info(f"Starting Session... Load balancing across {len(self.urls)} Google Accounts.")
         
         asyncio.create_task(self._poll_loop())
@@ -593,3 +709,4 @@ class TunnelClient:
 if __name__ == "__main__":
     try: asyncio.run(TunnelClient(SERVER_URLS, SOCKS5_HOST, SOCKS5_PORT).run())
     except KeyboardInterrupt: log.info("Stopped.")
+
